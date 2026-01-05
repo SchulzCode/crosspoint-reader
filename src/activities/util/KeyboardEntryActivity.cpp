@@ -3,15 +3,74 @@
 #include "MappedInputManager.h"
 #include "fontIds.h"
 
+#include <Arduino.h>
+
+#include <cstring>
+#include <string>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
 // Keyboard layouts - lowercase
 const char* const KeyboardEntryActivity::keyboard[NUM_ROWS] = {
     "`1234567890-=", "qwertyuiop[]\\", "asdfghjkl;'", "zxcvbnm,./",
-    "^  _____<OK"  // ^ = shift, _ = space, < = backspace, OK = done
+    "^  _____<OK"  // ^ = shift, _ = space, < = backspace, OK = done (rendered as buttons)
 };
 
 // Keyboard layouts - uppercase/symbols
-const char* const KeyboardEntryActivity::keyboardShift[NUM_ROWS] = {"~!@#$%^&*()_+", "QWERTYUIOP{}|", "ASDFGHJKL:\"",
-                                                                    "ZXCVBNM<>?", "SPECIAL ROW"};
+// Keep the bottom row the same length as the lowercase row to avoid any accidental indexing surprises.
+const char* const KeyboardEntryActivity::keyboardShift[NUM_ROWS] = {
+    "~!@#$%^&*()_+",
+    "QWERTYUIOP{}|",
+    "ASDFGHJKL:\"",
+    "ZXCVBNM<>?",
+    "^  _____<OK"
+};
+
+namespace {
+
+static inline void requestRender(TaskHandle_t h) {
+  if (h) {
+    xTaskNotifyGive(h);
+  }
+}
+
+// Trim from the left until text fits; prefix with "..." when trimming occurs.
+static void trimLeftToWidth(const GfxRenderer& r, const int fontId, std::string& s, const int maxWidth) {
+  if (maxWidth <= 0) {
+    s.clear();
+    return;
+  }
+  if (s.empty()) return;
+  if (r.getTextWidth(fontId, s.c_str()) <= maxWidth) return;
+
+  const std::string ell = "...";
+  // Find earliest start index so that "..." + tail fits.
+  for (size_t start = 0; start <= s.size(); ++start) {
+    std::string candidate = ell + s.substr(start);  // safe: start <= size()
+    if (r.getTextWidth(fontId, candidate.c_str()) <= maxWidth) {
+      s.swap(candidate);
+      return;
+    }
+  }
+
+  // If nothing fits, keep a minimal marker.
+  s = ell;
+}
+
+static inline int centeredLeftMargin(const int pageWidth, const int rowChars, const int keyWidth, const int keySpacing) {
+  // width = N*keyWidth + (N-1)*keySpacing
+  const int rowWidth = rowChars * keyWidth + (rowChars > 0 ? (rowChars - 1) * keySpacing : 0);
+  const int m = (pageWidth - rowWidth) / 2;
+  return (m < 0) ? 0 : m;
+}
+
+static inline int spanWidth(const int cols, const int keyWidth, const int keySpacing) {
+  return cols * keyWidth + (cols > 0 ? (cols - 1) * keySpacing : 0);
+}
+
+}  // namespace
 
 void KeyboardEntryActivity::taskTrampoline(void* param) {
   auto* self = static_cast<KeyboardEntryActivity*>(param);
@@ -19,14 +78,14 @@ void KeyboardEntryActivity::taskTrampoline(void* param) {
 }
 
 void KeyboardEntryActivity::displayTaskLoop() {
-  while (true) {
-    if (updateRequired) {
-      updateRequired = false;
-      xSemaphoreTake(renderingMutex, portMAX_DELAY);
-      render();
-      xSemaphoreGive(renderingMutex);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+  for (;;) {
+    // Block until someone requests a render. :contentReference[oaicite:3]{index=3}
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (!renderingMutex) continue;
+    xSemaphoreTake(renderingMutex, portMAX_DELAY);
+    render();
+    xSemaphoreGive(renderingMutex);
   }
 }
 
@@ -35,70 +94,65 @@ void KeyboardEntryActivity::onEnter() {
 
   renderingMutex = xSemaphoreCreateMutex();
 
-  // Trigger first update
-  updateRequired = true;
+  xTaskCreate(&KeyboardEntryActivity::taskTrampoline,
+              "KeyboardEntryActivity",
+              2048,
+              this,
+              1,
+              &displayTaskHandle);
 
-  xTaskCreate(&KeyboardEntryActivity::taskTrampoline, "KeyboardEntryActivity",
-              2048,               // Stack size
-              this,               // Parameters
-              1,                  // Priority
-              &displayTaskHandle  // Task handle
-  );
+  requestRender(displayTaskHandle);
 }
 
 void KeyboardEntryActivity::onExit() {
   Activity::onExit();
 
-  // Wait until not rendering to delete task to avoid killing mid-instruction to EPD
-  xSemaphoreTake(renderingMutex, portMAX_DELAY);
+  // Avoid killing the task mid-render / mid-EPD operations
+  if (renderingMutex) {
+    xSemaphoreTake(renderingMutex, portMAX_DELAY);
+  }
+
   if (displayTaskHandle) {
     vTaskDelete(displayTaskHandle);
     displayTaskHandle = nullptr;
   }
-  vSemaphoreDelete(renderingMutex);
-  renderingMutex = nullptr;
-}
 
-int KeyboardEntryActivity::getRowLength(const int row) const {
-  if (row < 0 || row >= NUM_ROWS) return 0;
-
-  // Return actual length of each row based on keyboard layout
-  switch (row) {
-    case 0:
-      return 13;  // `1234567890-=
-    case 1:
-      return 13;  // qwertyuiop[]backslash
-    case 2:
-      return 11;  // asdfghjkl;'
-    case 3:
-      return 10;  // zxcvbnm,./
-    case 4:
-      return 10;  // caps (2 wide), space (5 wide), backspace (2 wide), OK
-    default:
-      return 0;
+  if (renderingMutex) {
+    xSemaphoreGive(renderingMutex);
+    vSemaphoreDelete(renderingMutex);
+    renderingMutex = nullptr;
   }
 }
 
+int KeyboardEntryActivity::getRowLength(const int row) const {
+  static const int lens[NUM_ROWS] = {13, 13, 11, 10, 10};
+  if (row < 0 || row >= NUM_ROWS) return 0;
+  return lens[row];
+}
+
 char KeyboardEntryActivity::getSelectedChar() const {
+  if (selectedRow < 0 || selectedRow >= NUM_ROWS) return '\0';
+
+  // Special row is handled by handleKeyPress() and rendered as buttons.
+  if (selectedRow == SPECIAL_ROW) return '\0';
+
   const char* const* layout = shiftActive ? keyboardShift : keyboard;
 
-  if (selectedRow < 0 || selectedRow >= NUM_ROWS) return '\0';
-  if (selectedCol < 0 || selectedCol >= getRowLength(selectedRow)) return '\0';
+  const int rowLen = getRowLength(selectedRow);
+  if (selectedCol < 0 || selectedCol >= rowLen) return '\0';
 
   return layout[selectedRow][selectedCol];
 }
 
 void KeyboardEntryActivity::handleKeyPress() {
-  // Handle special row (bottom row with shift, space, backspace, done)
+  // Special row (bottom row with shift, space, backspace, done)
   if (selectedRow == SPECIAL_ROW) {
     if (selectedCol >= SHIFT_COL && selectedCol < SPACE_COL) {
-      // Shift toggle
       shiftActive = !shiftActive;
       return;
     }
 
     if (selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL) {
-      // Space bar
       if (maxLength == 0 || text.length() < maxLength) {
         text += ' ';
       }
@@ -106,7 +160,6 @@ void KeyboardEntryActivity::handleKeyPress() {
     }
 
     if (selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL) {
-      // Backspace
       if (!text.empty()) {
         text.pop_back();
       }
@@ -114,7 +167,6 @@ void KeyboardEntryActivity::handleKeyPress() {
     }
 
     if (selectedCol >= DONE_COL) {
-      // Done button
       if (onComplete) {
         onComplete(text);
       }
@@ -124,12 +176,11 @@ void KeyboardEntryActivity::handleKeyPress() {
 
   // Regular character
   const char c = getSelectedChar();
-  if (c == '\0') {
-    return;
-  }
+  if (c == '\0') return;
 
   if (maxLength == 0 || text.length() < maxLength) {
     text += c;
+
     // Auto-disable shift after typing a letter
     if (shiftActive && ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
       shiftActive = false;
@@ -138,15 +189,15 @@ void KeyboardEntryActivity::handleKeyPress() {
 }
 
 void KeyboardEntryActivity::loop() {
-  // Navigation
+  bool changed = false;
+
   if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     if (selectedRow > 0) {
       selectedRow--;
-      // Clamp column to valid range for new row
       const int maxCol = getRowLength(selectedRow) - 1;
       if (selectedCol > maxCol) selectedCol = maxCol;
+      changed = true;
     }
-    updateRequired = true;
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
@@ -154,121 +205,104 @@ void KeyboardEntryActivity::loop() {
       selectedRow++;
       const int maxCol = getRowLength(selectedRow) - 1;
       if (selectedCol > maxCol) selectedCol = maxCol;
+      changed = true;
     }
-    updateRequired = true;
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    // Special bottom row case
     if (selectedRow == SPECIAL_ROW) {
-      // Bottom row has special key widths
-      if (selectedCol >= SHIFT_COL && selectedCol < SPACE_COL) {
-        // In shift key, do nothing
-      } else if (selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL) {
-        // In space bar, move to shift
+      if (selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL) {
         selectedCol = SHIFT_COL;
+        changed = true;
       } else if (selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL) {
-        // In backspace, move to space
         selectedCol = SPACE_COL;
+        changed = true;
       } else if (selectedCol >= DONE_COL) {
-        // At done button, move to backspace
         selectedCol = BACKSPACE_COL;
+        changed = true;
       }
-      updateRequired = true;
-      return;
+    } else {
+      if (selectedCol > 0) {
+        selectedCol--;
+        changed = true;
+      } else if (selectedRow > 0) {
+        selectedRow--;
+        selectedCol = getRowLength(selectedRow) - 1;
+        changed = true;
+      }
     }
-
-    if (selectedCol > 0) {
-      selectedCol--;
-    } else if (selectedRow > 0) {
-      // Wrap to previous row
-      selectedRow--;
-      selectedCol = getRowLength(selectedRow) - 1;
-    }
-    updateRequired = true;
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
     const int maxCol = getRowLength(selectedRow) - 1;
 
-    // Special bottom row case
     if (selectedRow == SPECIAL_ROW) {
-      // Bottom row has special key widths
       if (selectedCol >= SHIFT_COL && selectedCol < SPACE_COL) {
-        // In shift key, move to space
         selectedCol = SPACE_COL;
+        changed = true;
       } else if (selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL) {
-        // In space bar, move to backspace
         selectedCol = BACKSPACE_COL;
+        changed = true;
       } else if (selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL) {
-        // In backspace, move to done
         selectedCol = DONE_COL;
-      } else if (selectedCol >= DONE_COL) {
-        // At done button, do nothing
+        changed = true;
       }
-      updateRequired = true;
-      return;
+    } else {
+      if (selectedCol < maxCol) {
+        selectedCol++;
+        changed = true;
+      } else if (selectedRow < NUM_ROWS - 1) {
+        selectedRow++;
+        selectedCol = 0;
+        changed = true;
+      }
     }
-
-    if (selectedCol < maxCol) {
-      selectedCol++;
-    } else if (selectedRow < NUM_ROWS - 1) {
-      // Wrap to next row
-      selectedRow++;
-      selectedCol = 0;
-    }
-    updateRequired = true;
   }
 
-  // Selection
   if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
     handleKeyPress();
-    updateRequired = true;
+    changed = true;
   }
 
-  // Cancel
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
     if (onCancel) {
       onCancel();
     }
-    updateRequired = true;
+    changed = true;
+  }
+
+  if (changed) {
+    requestRender(displayTaskHandle);
   }
 }
 
 void KeyboardEntryActivity::render() const {
-  const auto pageWidth = renderer.getScreenWidth();
+  const int pageWidth = renderer.getScreenWidth();
 
   renderer.clearScreen();
 
-  // Draw title
+  // Title
   renderer.drawCenteredText(UI_10_FONT_ID, startY, title.c_str());
 
-  // Draw input field
+  // Input field
   const int inputY = startY + 22;
   renderer.drawText(UI_10_FONT_ID, 10, inputY, "[");
 
   std::string displayText;
   if (isPassword) {
-    displayText = std::string(text.length(), '*');
+    displayText.assign(text.length(), '*');
   } else {
     displayText = text;
   }
+  displayText += "_";  // cursor at end
 
-  // Show cursor at end
-  displayText += "_";
-
-  // Truncate if too long for display - use actual character width from font
-  int approxCharWidth = renderer.getSpaceWidth(UI_10_FONT_ID);
-  if (approxCharWidth < 1) approxCharWidth = 8;  // Fallback to approximate width
-  const int maxDisplayLen = (pageWidth - 40) / approxCharWidth;
-  if (displayText.length() > static_cast<size_t>(maxDisplayLen)) {
-    displayText = "..." + displayText.substr(displayText.length() - maxDisplayLen + 3);
-  }
+  const int maxTextWidth = pageWidth - 40;  // inside brackets
+  trimLeftToWidth(renderer, UI_10_FONT_ID, displayText, maxTextWidth);
 
   renderer.drawText(UI_10_FONT_ID, 20, inputY, displayText.c_str());
   renderer.drawText(UI_10_FONT_ID, pageWidth - 15, inputY, "]");
 
-  // Draw keyboard - use compact spacing to fit 5 rows on screen
+  // Keyboard
   const int keyboardStartY = inputY + 25;
   constexpr int keyWidth = 18;
   constexpr int keyHeight = 18;
@@ -276,64 +310,57 @@ void KeyboardEntryActivity::render() const {
 
   const char* const* layout = shiftActive ? keyboardShift : keyboard;
 
-  // Calculate left margin to center the longest row (13 keys)
-  constexpr int maxRowWidth = KEYS_PER_ROW * (keyWidth + keySpacing);
-  const int leftMargin = (pageWidth - maxRowWidth) / 2;
+  // Center based on the longest (13-key) row.
+  const int leftMargin = centeredLeftMargin(pageWidth, KEYS_PER_ROW, keyWidth, keySpacing);
 
-  for (int row = 0; row < NUM_ROWS; row++) {
+  for (int row = 0; row < NUM_ROWS; ++row) {
     const int rowY = keyboardStartY + row * (keyHeight + keySpacing);
-
-    // Left-align all rows for consistent navigation
     const int startX = leftMargin;
 
-    // Handle bottom row (row 4) specially with proper multi-column keys
-    if (row == 4) {
-      // Bottom row layout: CAPS (2 cols) | SPACE (5 cols) | <- (2 cols) | OK (2 cols)
-      // Total: 11 visual columns, but we use logical positions for selection
+    if (row == SPECIAL_ROW) {
+      // Bottom row: CAPS(2) | SPACE(5) | <- (2) | OK(2)
+      const int capsSpan = 2;
+      const int spaceSpan = 5;
+      const int bsSpan = 2;
+      const int okSpan = 2;
 
-      int currentX = startX;
+      int x = startX;
 
-      // CAPS key (logical col 0, spans 2 key widths)
-      const bool capsSelected = (selectedRow == 4 && selectedCol >= SHIFT_COL && selectedCol < SPACE_COL);
-      renderItemWithSelector(currentX + 2, rowY, shiftActive ? "CAPS" : "caps", capsSelected);
-      currentX += 2 * (keyWidth + keySpacing);
+      const bool capsSelected = (selectedRow == SPECIAL_ROW && selectedCol >= SHIFT_COL && selectedCol < SPACE_COL);
+      renderItemWithSelector(x + 2, rowY, shiftActive ? "CAPS" : "caps", capsSelected);
+      x += spanWidth(capsSpan, keyWidth, keySpacing) + keySpacing;
 
-      // Space bar (logical cols 2-6, spans 5 key widths)
-      const bool spaceSelected = (selectedRow == 4 && selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL);
-      const int spaceTextWidth = renderer.getTextWidth(UI_10_FONT_ID, "_____");
-      const int spaceXWidth = 5 * (keyWidth + keySpacing);
-      const int spaceXPos = currentX + (spaceXWidth - spaceTextWidth) / 2;
-      renderItemWithSelector(spaceXPos, rowY, "_____", spaceSelected);
-      currentX += spaceXWidth;
+      const bool spaceSelected = (selectedRow == SPECIAL_ROW && selectedCol >= SPACE_COL && selectedCol < BACKSPACE_COL);
+      const int spaceW = spanWidth(spaceSpan, keyWidth, keySpacing);
+      const int spaceTextW = renderer.getTextWidth(UI_10_FONT_ID, "_____");
+      const int spaceX = x + (spaceW - spaceTextW) / 2;
+      renderItemWithSelector(spaceX, rowY, "_____", spaceSelected);
+      x += spaceW + keySpacing;
 
-      // Backspace key (logical col 7, spans 2 key widths)
-      const bool bsSelected = (selectedRow == 4 && selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL);
-      renderItemWithSelector(currentX + 2, rowY, "<-", bsSelected);
-      currentX += 2 * (keyWidth + keySpacing);
+      const bool bsSelected = (selectedRow == SPECIAL_ROW && selectedCol >= BACKSPACE_COL && selectedCol < DONE_COL);
+      renderItemWithSelector(x + 2, rowY, "<-", bsSelected);
+      x += spanWidth(bsSpan, keyWidth, keySpacing) + keySpacing;
 
-      // OK button (logical col 9, spans 2 key widths)
-      const bool okSelected = (selectedRow == 4 && selectedCol >= DONE_COL);
-      renderItemWithSelector(currentX + 2, rowY, "OK", okSelected);
+      const bool okSelected = (selectedRow == SPECIAL_ROW && selectedCol >= DONE_COL);
+      renderItemWithSelector(x + 2, rowY, "OK", okSelected);
     } else {
-      // Regular rows: render each key individually
-      for (int col = 0; col < getRowLength(row); col++) {
-        // Get the character to display
+      const int rowLen = getRowLength(row);
+      for (int col = 0; col < rowLen; ++col) {
         const char c = layout[row][col];
-        std::string keyLabel(1, c);
-        const int charWidth = renderer.getTextWidth(UI_10_FONT_ID, keyLabel.c_str());
+        char label[2] = {c, '\0'};
 
+        const int charWidth = renderer.getTextWidth(UI_10_FONT_ID, label);
         const int keyX = startX + col * (keyWidth + keySpacing) + (keyWidth - charWidth) / 2;
-        const bool isSelected = row == selectedRow && col == selectedCol;
-        renderItemWithSelector(keyX, rowY, keyLabel.c_str(), isSelected);
+
+        const bool isSelected = (row == selectedRow && col == selectedCol);
+        renderItemWithSelector(keyX, rowY, label, isSelected);
       }
     }
   }
 
-  // Draw help text
+  // Hints
   const auto labels = mappedInput.mapLabels("« Back", "Select", "Left", "Right");
   renderer.drawButtonHints(UI_10_FONT_ID, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
-  // Draw side button hints for Up/Down navigation
   renderer.drawSideButtonHints(UI_10_FONT_ID, "Up", "Down");
 
   renderer.displayBuffer();

@@ -1,13 +1,142 @@
 #include "HomeActivity.h"
 
+#include <Arduino.h>
 #include <Epub.h>
 #include <GfxRenderer.h>
 #include <SDCardManager.h>
+
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "ScreenComponents.h"
 #include "fontIds.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+
+namespace {
+
+static bool endsWith(const std::string& s, const char* suffix) {
+  const size_t sl = s.size();
+  const size_t su = std::strlen(suffix);
+  return (sl >= su) && (s.compare(sl - su, su, suffix) == 0);
+}
+
+static std::string baseName(const std::string& path) {
+  const size_t lastSlash = path.find_last_of('/');
+  return (lastSlash == std::string::npos) ? path : path.substr(lastSlash + 1);
+}
+
+static void stripKnownExt(std::string& name) {
+  if (endsWith(name, ".xtch")) {
+    name.resize(name.size() - 5);
+  } else if (endsWith(name, ".xtc")) {
+    name.resize(name.size() - 4);
+  }
+}
+
+static void trimToWidthWithEllipsis(const GfxRenderer& r, const int fontId, std::string& s, const int maxWidth) {
+  if (s.empty()) return;
+
+  if (r.getTextWidth(fontId, s.c_str()) <= maxWidth) return;
+
+  // Ensure space for "..."
+  const char* ell = "...";
+  while (!s.empty() && r.getTextWidth(fontId, (s + ell).c_str()) > maxWidth) {
+    s.pop_back();
+  }
+  if (!s.empty()) s += ell;
+}
+
+static std::vector<std::string> wrapTextLines(const GfxRenderer& r,
+                                              const int fontId,
+                                              const std::string& text,
+                                              const int maxWidth,
+                                              const int maxLines) {
+  std::vector<std::string> lines;
+  lines.reserve(static_cast<size_t>(maxLines));
+
+  const int spaceWidth = r.getSpaceWidth(fontId);
+
+  std::string current;
+  int currentWidth = 0;
+
+  auto pushLine = [&](bool forceEllipsis) {
+    if (current.empty()) return;
+
+    if (forceEllipsis) {
+      trimToWidthWithEllipsis(r, fontId, current, maxWidth);
+      if (!endsWith(current, "...")) current += "...";
+      trimToWidthWithEllipsis(r, fontId, current, maxWidth);
+    }
+
+    lines.push_back(current);
+    current.clear();
+    currentWidth = 0;
+  };
+
+  // Manual word scan (no stringstream)
+  size_t pos = 0;
+  while (pos < text.size()) {
+    while (pos < text.size() && text[pos] == ' ') ++pos;
+    if (pos >= text.size()) break;
+
+    const size_t start = pos;
+    while (pos < text.size() && text[pos] != ' ') ++pos;
+
+    std::string word = text.substr(start, pos - start);
+
+    // If a single word is too wide, trim it.
+    while (word.size() > 5 && r.getTextWidth(fontId, word.c_str()) > maxWidth) {
+      word.resize(word.size() - 4);
+      word += "...";
+    }
+
+    const int wordWidth = r.getTextWidth(fontId, word.c_str());
+    const int needed = (currentWidth == 0) ? wordWidth : (currentWidth + spaceWidth + wordWidth);
+
+    if (needed > maxWidth && currentWidth != 0) {
+      // Start a new line
+      if (static_cast<int>(lines.size()) == maxLines - 1) {
+        // Last line: append ellipsis and stop
+        pushLine(true);
+        return lines;
+      }
+      pushLine(false);
+    }
+
+    if (current.empty()) {
+      current = word;
+      currentWidth = wordWidth;
+    } else {
+      current += ' ';
+      current += word;
+      currentWidth = needed;
+    }
+
+    if (static_cast<int>(lines.size()) >= maxLines) {
+      return lines;
+    }
+  }
+
+  if (!current.empty() && static_cast<int>(lines.size()) < maxLines) {
+    pushLine(false);
+  }
+
+  return lines;
+}
+
+static void notifyRender(TaskHandle_t h) {
+  if (h) {
+    xTaskNotifyGive(h);
+  }
+}
+
+}  // namespace
 
 void HomeActivity::taskTrampoline(void* param) {
   auto* self = static_cast<HomeActivity*>(param);
@@ -21,60 +150,58 @@ void HomeActivity::onEnter() {
 
   renderingMutex = xSemaphoreCreateMutex();
 
-  // Check if we have a book to continue reading
+  // Reset state
+  selectorIndex = 0;
+  lastBookTitle.clear();
+  lastBookAuthor.clear();
+
   hasContinueReading = !APP_STATE.openEpubPath.empty() && SdMan.exists(APP_STATE.openEpubPath.c_str());
 
   if (hasContinueReading) {
-    // Extract filename from path for display
-    lastBookTitle = APP_STATE.openEpubPath;
-    const size_t lastSlash = lastBookTitle.find_last_of('/');
-    if (lastSlash != std::string::npos) {
-      lastBookTitle = lastBookTitle.substr(lastSlash + 1);
-    }
+    // Default to filename-based title
+    lastBookTitle = baseName(APP_STATE.openEpubPath);
 
-    const std::string ext4 = lastBookTitle.length() >= 4 ? lastBookTitle.substr(lastBookTitle.length() - 4) : "";
-    const std::string ext5 = lastBookTitle.length() >= 5 ? lastBookTitle.substr(lastBookTitle.length() - 5) : "";
-    // If epub, try to load the metadata for title/author
-    if (ext5 == ".epub") {
+    // Prefer metadata for epub
+    if (endsWith(APP_STATE.openEpubPath, ".epub")) {
       Epub epub(APP_STATE.openEpubPath, "/.crosspoint");
       epub.load(false);
-      if (!epub.getTitle().empty()) {
-        lastBookTitle = std::string(epub.getTitle());
-      }
-      if (!epub.getAuthor().empty()) {
-        lastBookAuthor = std::string(epub.getAuthor());
-      }
-    } else if (ext5 == ".xtch") {
-      lastBookTitle.resize(lastBookTitle.length() - 5);
-    } else if (ext4 == ".xtc") {
-      lastBookTitle.resize(lastBookTitle.length() - 4);
+      if (!epub.getTitle().empty()) lastBookTitle = std::string(epub.getTitle());
+      if (!epub.getAuthor().empty()) lastBookAuthor = std::string(epub.getAuthor());
+    } else {
+      stripKnownExt(lastBookTitle);
     }
   }
 
-  selectorIndex = 0;
+  // Create render task
+  xTaskCreate(&HomeActivity::taskTrampoline,
+              "HomeActivityTask",
+              2048,
+              this,
+              1,
+              &displayTaskHandle);
 
-  // Trigger first update
-  updateRequired = true;
-
-  xTaskCreate(&HomeActivity::taskTrampoline, "HomeActivityTask",
-              2048,               // Stack size
-              this,               // Parameters
-              1,                  // Priority
-              &displayTaskHandle  // Task handle
-  );
+  // First render
+  notifyRender(displayTaskHandle);
 }
 
 void HomeActivity::onExit() {
   Activity::onExit();
 
-  // Wait until not rendering to delete task to avoid killing mid-instruction to EPD
-  xSemaphoreTake(renderingMutex, portMAX_DELAY);
+  // Ensure we don't kill the task mid-render / mid-EPD
+  if (renderingMutex) {
+    xSemaphoreTake(renderingMutex, portMAX_DELAY);
+  }
+
   if (displayTaskHandle) {
     vTaskDelete(displayTaskHandle);
     displayTaskHandle = nullptr;
   }
-  vSemaphoreDelete(renderingMutex);
-  renderingMutex = nullptr;
+
+  if (renderingMutex) {
+    xSemaphoreGive(renderingMutex);
+    vSemaphoreDelete(renderingMutex);
+    renderingMutex = nullptr;
+  }
 }
 
 void HomeActivity::loop() {
@@ -86,230 +213,138 @@ void HomeActivity::loop() {
   const int menuCount = getMenuItemCount();
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (hasContinueReading) {
-      // Menu: Continue Reading, Browse, File transfer, Settings
-      if (selectorIndex == 0) {
-        onContinueReading();
-      } else if (selectorIndex == 1) {
-        onReaderOpen();
-      } else if (selectorIndex == 2) {
-        onFileTransferOpen();
-      } else if (selectorIndex == 3) {
-        onSettingsOpen();
-      }
-    } else {
-      // Menu: Browse, File transfer, Settings
-      if (selectorIndex == 0) {
-        onReaderOpen();
-      } else if (selectorIndex == 1) {
-        onFileTransferOpen();
-      } else if (selectorIndex == 2) {
-        onSettingsOpen();
-      }
+    if (hasContinueReading && selectorIndex == 0) {
+      onContinueReading();
+      return;
     }
-  } else if (prevPressed) {
+
+    const int base = hasContinueReading ? 1 : 0;
+    const int idx = selectorIndex - base;
+
+    if (idx == 0) onReaderOpen();
+    else if (idx == 1) onFileTransferOpen();
+    else if (idx == 2) onSettingsOpen();
+    return;
+  }
+
+  if (prevPressed) {
     selectorIndex = (selectorIndex + menuCount - 1) % menuCount;
-    updateRequired = true;
+    notifyRender(displayTaskHandle);
   } else if (nextPressed) {
     selectorIndex = (selectorIndex + 1) % menuCount;
-    updateRequired = true;
+    notifyRender(displayTaskHandle);
   }
 }
 
 void HomeActivity::displayTaskLoop() {
-  while (true) {
-    if (updateRequired) {
-      updateRequired = false;
-      xSemaphoreTake(renderingMutex, portMAX_DELAY);
-      render();
-      xSemaphoreGive(renderingMutex);
-    }
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+  for (;;) {
+    // Block until loop() signals a render (binary/counting-semaphore style). :contentReference[oaicite:2]{index=2}
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if (!renderingMutex) continue;
+    xSemaphoreTake(renderingMutex, portMAX_DELAY);
+    render();
+    xSemaphoreGive(renderingMutex);
   }
 }
 
 void HomeActivity::render() const {
   renderer.clearScreen();
 
-  const auto pageWidth = renderer.getScreenWidth();
-  const auto pageHeight = renderer.getScreenHeight();
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
 
   constexpr int margin = 20;
   constexpr int bottomMargin = 60;
 
-  // --- Top "book" card for the current title (selectorIndex == 0) ---
+  // --- Top "book" card ---
   const int bookWidth = pageWidth / 2;
   const int bookHeight = pageHeight / 2;
   const int bookX = (pageWidth - bookWidth) / 2;
   constexpr int bookY = 30;
+
   const bool bookSelected = hasContinueReading && selectorIndex == 0;
 
-  // Draw book card regardless, fill with message based on `hasContinueReading`
-  {
-    if (bookSelected) {
-      renderer.fillRect(bookX, bookY, bookWidth, bookHeight);
-    } else {
-      renderer.drawRect(bookX, bookY, bookWidth, bookHeight);
-    }
+  // Card outline/fill
+  if (bookSelected) renderer.fillRect(bookX, bookY, bookWidth, bookHeight);
+  else renderer.drawRect(bookX, bookY, bookWidth, bookHeight);
 
-    // Bookmark icon in the top-right corner of the card
-    const int bookmarkWidth = bookWidth / 8;
-    const int bookmarkHeight = bookHeight / 5;
-    const int bookmarkX = bookX + bookWidth - bookmarkWidth - 8;
-    constexpr int bookmarkY = bookY + 1;
+  // Bookmark icon
+  const int bookmarkWidth = bookWidth / 8;
+  const int bookmarkHeight = bookHeight / 5;
+  const int bookmarkX = bookX + bookWidth - bookmarkWidth - 8;
+  constexpr int bookmarkY = bookY + 1;
 
-    // Main bookmark body (solid)
-    renderer.fillRect(bookmarkX, bookmarkY, bookmarkWidth, bookmarkHeight, !bookSelected);
+  renderer.fillRect(bookmarkX, bookmarkY, bookmarkWidth, bookmarkHeight, !bookSelected);
 
-    // Carve out an inverted triangle notch at the bottom center to create angled points
-    const int notchHeight = bookmarkHeight / 2;  // depth of the notch
-    for (int i = 0; i < notchHeight; ++i) {
-      const int y = bookmarkY + bookmarkHeight - 1 - i;
-      const int xStart = bookmarkX + i;
-      const int width = bookmarkWidth - 2 * i;
-      if (width <= 0) {
-        break;
-      }
-      // Draw a horizontal strip in the opposite color to "cut" the notch
-      renderer.fillRect(xStart, y, width, 1, bookSelected);
-    }
+  const int notchHeight = bookmarkHeight / 2;
+  for (int i = 0; i < notchHeight; ++i) {
+    const int y = bookmarkY + bookmarkHeight - 1 - i;
+    const int xStart = bookmarkX + i;
+    const int w = bookmarkWidth - 2 * i;
+    if (w <= 0) break;
+    renderer.fillRect(xStart, y, w, 1, bookSelected);
   }
 
   if (hasContinueReading) {
-    // Split into words (avoid stringstream to keep this light on the MCU)
-    std::vector<std::string> words;
-    words.reserve(8);
-    size_t pos = 0;
-    while (pos < lastBookTitle.size()) {
-      while (pos < lastBookTitle.size() && lastBookTitle[pos] == ' ') {
-        ++pos;
-      }
-      if (pos >= lastBookTitle.size()) {
-        break;
-      }
-      const size_t start = pos;
-      while (pos < lastBookTitle.size() && lastBookTitle[pos] != ' ') {
-        ++pos;
-      }
-      words.emplace_back(lastBookTitle.substr(start, pos - start));
-    }
-
-    std::vector<std::string> lines;
-    std::string currentLine;
-    // Extra padding inside the card so text doesn't hug the border
     const int maxLineWidth = bookWidth - 40;
-    const int spaceWidth = renderer.getSpaceWidth(UI_12_FONT_ID);
 
-    for (auto& i : words) {
-      // If we just hit the line limit (3), stop processing words
-      if (lines.size() >= 3) {
-        // Limit to 3 lines
-        // Still have words left, so add ellipsis to last line
-        lines.back().append("...");
+    std::vector<std::string> lines = wrapTextLines(renderer, UI_12_FONT_ID, lastBookTitle, maxLineWidth, 3);
 
-        while (!lines.back().empty() && renderer.getTextWidth(UI_12_FONT_ID, lines.back().c_str()) > maxLineWidth) {
-          lines.back().resize(lines.back().size() - 5);
-          lines.back().append("...");
-        }
-        break;
-      }
-
-      int wordWidth = renderer.getTextWidth(UI_12_FONT_ID, i.c_str());
-      while (wordWidth > maxLineWidth && i.size() > 5) {
-        // Word itself is too long, trim it
-        i.resize(i.size() - 5);
-        i.append("...");
-        wordWidth = renderer.getTextWidth(UI_12_FONT_ID, i.c_str());
-      }
-
-      int newLineWidth = renderer.getTextWidth(UI_12_FONT_ID, currentLine.c_str());
-      if (newLineWidth > 0) {
-        newLineWidth += spaceWidth;
-      }
-      newLineWidth += wordWidth;
-
-      if (newLineWidth > maxLineWidth && !currentLine.empty()) {
-        // New line too long, push old line
-        lines.push_back(currentLine);
-        currentLine = i;
-      } else {
-        currentLine.append(" ").append(i);
-      }
-    }
-
-    // If lower than the line limit, push remaining words
-    if (!currentLine.empty() && lines.size() < 3) {
-      lines.push_back(currentLine);
-    }
-
-    // Book title text
     int totalTextHeight = renderer.getLineHeight(UI_12_FONT_ID) * static_cast<int>(lines.size());
     if (!lastBookAuthor.empty()) {
       totalTextHeight += renderer.getLineHeight(UI_10_FONT_ID) * 3 / 2;
     }
 
-    // Vertically center the title block within the card
-    int titleYStart = bookY + (bookHeight - totalTextHeight) / 2;
+    int y = bookY + (bookHeight - totalTextHeight) / 2;
 
     for (const auto& line : lines) {
-      renderer.drawCenteredText(UI_12_FONT_ID, titleYStart, line.c_str(), !bookSelected);
-      titleYStart += renderer.getLineHeight(UI_12_FONT_ID);
+      renderer.drawCenteredText(UI_12_FONT_ID, y, line.c_str(), !bookSelected);
+      y += renderer.getLineHeight(UI_12_FONT_ID);
     }
 
     if (!lastBookAuthor.empty()) {
-      titleYStart += renderer.getLineHeight(UI_10_FONT_ID) / 2;
-      std::string trimmedAuthor = lastBookAuthor;
-      // Trim author if too long
-      while (renderer.getTextWidth(UI_10_FONT_ID, trimmedAuthor.c_str()) > maxLineWidth && !trimmedAuthor.empty()) {
-        trimmedAuthor.resize(trimmedAuthor.size() - 5);
-        trimmedAuthor.append("...");
-      }
-      renderer.drawCenteredText(UI_10_FONT_ID, titleYStart, trimmedAuthor.c_str(), !bookSelected);
+      y += renderer.getLineHeight(UI_10_FONT_ID) / 2;
+      std::string author = lastBookAuthor;
+      trimToWidthWithEllipsis(renderer, UI_10_FONT_ID, author, maxLineWidth);
+      renderer.drawCenteredText(UI_10_FONT_ID, y, author.c_str(), !bookSelected);
     }
 
-    renderer.drawCenteredText(UI_10_FONT_ID, bookY + bookHeight - renderer.getLineHeight(UI_10_FONT_ID) * 3 / 2,
-                              "Continue Reading", !bookSelected);
+    renderer.drawCenteredText(UI_10_FONT_ID,
+                              bookY + bookHeight - renderer.getLineHeight(UI_10_FONT_ID) * 3 / 2,
+                              "Continue Reading",
+                              !bookSelected);
   } else {
-    // No book to continue reading
-    const int y =
-        bookY + (bookHeight - renderer.getLineHeight(UI_12_FONT_ID) - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
+    const int y = bookY + (bookHeight - renderer.getLineHeight(UI_12_FONT_ID) - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
     renderer.drawCenteredText(UI_12_FONT_ID, y, "No open book");
     renderer.drawCenteredText(UI_10_FONT_ID, y + renderer.getLineHeight(UI_12_FONT_ID), "Start reading below");
   }
 
-  // --- Bottom menu tiles (indices 1-3) ---
+  // --- Bottom menu tiles ---
+  static constexpr const char* items[3] = {"Browse files", "File transfer", "Settings"};
+
   const int menuTileWidth = pageWidth - 2 * margin;
   constexpr int menuTileHeight = 50;
   constexpr int menuSpacing = 10;
   constexpr int totalMenuHeight = 3 * menuTileHeight + 2 * menuSpacing;
 
   int menuStartY = bookY + bookHeight + 20;
-  // Ensure we don't collide with the bottom button legend
   const int maxMenuStartY = pageHeight - bottomMargin - totalMenuHeight - margin;
-  if (menuStartY > maxMenuStartY) {
-    menuStartY = maxMenuStartY;
-  }
+  if (menuStartY > maxMenuStartY) menuStartY = maxMenuStartY;
 
   for (int i = 0; i < 3; ++i) {
-    constexpr const char* items[3] = {"Browse files", "File transfer", "Settings"};
     const int overallIndex = i + (getMenuItemCount() - 3);
-    constexpr int tileX = margin;
     const int tileY = menuStartY + i * (menuTileHeight + menuSpacing);
     const bool selected = selectorIndex == overallIndex;
 
-    if (selected) {
-      renderer.fillRect(tileX, tileY, menuTileWidth, menuTileHeight);
-    } else {
-      renderer.drawRect(tileX, tileY, menuTileWidth, menuTileHeight);
-    }
+    if (selected) renderer.fillRect(margin, tileY, menuTileWidth, menuTileHeight);
+    else renderer.drawRect(margin, tileY, menuTileWidth, menuTileHeight);
 
     const char* label = items[i];
     const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, label);
-    const int textX = tileX + (menuTileWidth - textWidth) / 2;
-    const int lineHeight = renderer.getLineHeight(UI_10_FONT_ID);
-    const int textY = tileY + (menuTileHeight - lineHeight) / 2;  // vertically centered assuming y is top of text
+    const int textX = margin + (menuTileWidth - textWidth) / 2;
+    const int textY = tileY + (menuTileHeight - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
 
-    // Invert text when the tile is selected, to contrast with the filled background
     renderer.drawText(UI_10_FONT_ID, textX, textY, label, !selected);
   }
 

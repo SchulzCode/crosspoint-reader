@@ -7,6 +7,10 @@
 #include <SPI.h>
 #include <builtinFonts/all.h>
 
+#include <memory>
+#include <string>
+#include <utility>
+
 #include "Battery.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
@@ -18,170 +22,122 @@
 #include "activities/reader/ReaderActivity.h"
 #include "activities/settings/SettingsActivity.h"
 #include "activities/util/FullScreenMessageActivity.h"
+#include "esp_sleep.h"
+#include "esp_system.h"
 #include "fontIds.h"
 
-#define SPI_FQ 40000000
-// Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
-#define EPD_SCLK 8   // SPI Clock
-#define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
-#define EPD_CS 21    // Chip Select
-#define EPD_DC 4     // Data/Command
-#define EPD_RST 5    // Reset
-#define EPD_BUSY 6   // Busy
+namespace cp {
+// C++11-compatible make_unique replacement
+template <typename T, typename... Args>
+static inline std::unique_ptr<T> make_unique(Args&&... args) {
+  return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+}
+}  // namespace cp
 
-#define UART0_RXD 20  // Used for USB connection detection
+namespace BoardPins {
+constexpr int EPD_SCLK = 8;   // SPI Clock
+constexpr int EPD_MOSI = 10;  // SPI MOSI
+constexpr int EPD_CS = 21;    // Chip Select
+constexpr int EPD_DC = 4;     // Data/Command
+constexpr int EPD_RST = 5;    // Reset
+constexpr int EPD_BUSY = 6;   // Busy
 
-#define SD_SPI_MISO 7
+constexpr int SD_SPI_MISO = 7;
 
-EInkDisplay einkDisplay(EPD_SCLK, EPD_MOSI, EPD_CS, EPD_DC, EPD_RST, EPD_BUSY);
-InputManager inputManager;
-MappedInputManager mappedInputManager(inputManager);
-GfxRenderer renderer(einkDisplay);
-Activity* currentActivity;
+// Used for USB connection detection
+constexpr int UART0_RXD = 20;
+}  // namespace BoardPins
 
-// Fonts
-EpdFont bookerly12RegularFont(&bookerly_12_regular);
-EpdFont bookerly12BoldFont(&bookerly_12_bold);
-EpdFont bookerly12ItalicFont(&bookerly_12_italic);
-EpdFont bookerly12BoldItalicFont(&bookerly_12_bolditalic);
-EpdFontFamily bookerly12FontFamily(&bookerly12RegularFont, &bookerly12BoldFont, &bookerly12ItalicFont,
-                                   &bookerly12BoldItalicFont);
-EpdFont bookerly14RegularFont(&bookerly_14_regular);
-EpdFont bookerly14BoldFont(&bookerly_14_bold);
-EpdFont bookerly14ItalicFont(&bookerly_14_italic);
-EpdFont bookerly14BoldItalicFont(&bookerly_14_bolditalic);
-EpdFontFamily bookerly14FontFamily(&bookerly14RegularFont, &bookerly14BoldFont, &bookerly14ItalicFont,
-                                   &bookerly14BoldItalicFont);
-EpdFont bookerly16RegularFont(&bookerly_16_regular);
-EpdFont bookerly16BoldFont(&bookerly_16_bold);
-EpdFont bookerly16ItalicFont(&bookerly_16_italic);
-EpdFont bookerly16BoldItalicFont(&bookerly_16_bolditalic);
-EpdFontFamily bookerly16FontFamily(&bookerly16RegularFont, &bookerly16BoldFont, &bookerly16ItalicFont,
-                                   &bookerly16BoldItalicFont);
-EpdFont bookerly18RegularFont(&bookerly_18_regular);
-EpdFont bookerly18BoldFont(&bookerly_18_bold);
-EpdFont bookerly18ItalicFont(&bookerly_18_italic);
-EpdFont bookerly18BoldItalicFont(&bookerly_18_bolditalic);
-EpdFontFamily bookerly18FontFamily(&bookerly18RegularFont, &bookerly18BoldFont, &bookerly18ItalicFont,
-                                   &bookerly18BoldItalicFont);
+static EInkDisplay einkDisplay(BoardPins::EPD_SCLK, BoardPins::EPD_MOSI, BoardPins::EPD_CS, BoardPins::EPD_DC,
+                               BoardPins::EPD_RST, BoardPins::EPD_BUSY);
+static InputManager inputManager;
+static MappedInputManager mappedInputManager(inputManager);
+static GfxRenderer renderer(einkDisplay);
 
-EpdFont notosans12RegularFont(&notosans_12_regular);
-EpdFont notosans12BoldFont(&notosans_12_bold);
-EpdFont notosans12ItalicFont(&notosans_12_italic);
-EpdFont notosans12BoldItalicFont(&notosans_12_bolditalic);
-EpdFontFamily notosans12FontFamily(&notosans12RegularFont, &notosans12BoldFont, &notosans12ItalicFont,
-                                   &notosans12BoldItalicFont);
-EpdFont notosans14RegularFont(&notosans_14_regular);
-EpdFont notosans14BoldFont(&notosans_14_bold);
-EpdFont notosans14ItalicFont(&notosans_14_italic);
-EpdFont notosans14BoldItalicFont(&notosans_14_bolditalic);
-EpdFontFamily notosans14FontFamily(&notosans14RegularFont, &notosans14BoldFont, &notosans14ItalicFont,
-                                   &notosans14BoldItalicFont);
-EpdFont notosans16RegularFont(&notosans_16_regular);
-EpdFont notosans16BoldFont(&notosans_16_bold);
-EpdFont notosans16ItalicFont(&notosans_16_italic);
-EpdFont notosans16BoldItalicFont(&notosans_16_bolditalic);
-EpdFontFamily notosans16FontFamily(&notosans16RegularFont, &notosans16BoldFont, &notosans16ItalicFont,
-                                   &notosans16BoldItalicFont);
-EpdFont notosans18RegularFont(&notosans_18_regular);
-EpdFont notosans18BoldFont(&notosans_18_bold);
-EpdFont notosans18ItalicFont(&notosans_18_italic);
-EpdFont notosans18BoldItalicFont(&notosans_18_bolditalic);
-EpdFontFamily notosans18FontFamily(&notosans18RegularFont, &notosans18BoldFont, &notosans18ItalicFont,
-                                   &notosans18BoldItalicFont);
+static std::unique_ptr<Activity> currentActivity;
+static std::string g_readerStartPath;
 
-EpdFont opendyslexic8RegularFont(&opendyslexic_8_regular);
-EpdFont opendyslexic8BoldFont(&opendyslexic_8_bold);
-EpdFont opendyslexic8ItalicFont(&opendyslexic_8_italic);
-EpdFont opendyslexic8BoldItalicFont(&opendyslexic_8_bolditalic);
-EpdFontFamily opendyslexic8FontFamily(&opendyslexic8RegularFont, &opendyslexic8BoldFont, &opendyslexic8ItalicFont,
-                                      &opendyslexic8BoldItalicFont);
-EpdFont opendyslexic10RegularFont(&opendyslexic_10_regular);
-EpdFont opendyslexic10BoldFont(&opendyslexic_10_bold);
-EpdFont opendyslexic10ItalicFont(&opendyslexic_10_italic);
-EpdFont opendyslexic10BoldItalicFont(&opendyslexic_10_bolditalic);
-EpdFontFamily opendyslexic10FontFamily(&opendyslexic10RegularFont, &opendyslexic10BoldFont, &opendyslexic10ItalicFont,
-                                       &opendyslexic10BoldItalicFont);
-EpdFont opendyslexic12RegularFont(&opendyslexic_12_regular);
-EpdFont opendyslexic12BoldFont(&opendyslexic_12_bold);
-EpdFont opendyslexic12ItalicFont(&opendyslexic_12_italic);
-EpdFont opendyslexic12BoldItalicFont(&opendyslexic_12_bolditalic);
-EpdFontFamily opendyslexic12FontFamily(&opendyslexic12RegularFont, &opendyslexic12BoldFont, &opendyslexic12ItalicFont,
-                                       &opendyslexic12BoldItalicFont);
-EpdFont opendyslexic14RegularFont(&opendyslexic_14_regular);
-EpdFont opendyslexic14BoldFont(&opendyslexic_14_bold);
-EpdFont opendyslexic14ItalicFont(&opendyslexic_14_italic);
-EpdFont opendyslexic14BoldItalicFont(&opendyslexic_14_bolditalic);
-EpdFontFamily opendyslexic14FontFamily(&opendyslexic14RegularFont, &opendyslexic14BoldFont, &opendyslexic14ItalicFont,
-                                       &opendyslexic14BoldItalicFont);
+// ---------- Font packs (removes boilerplate) ----------
+using BuiltinFontT = decltype(bookerly_12_regular);
 
-EpdFont smallFont(&notosans_8_regular);
-EpdFontFamily smallFontFamily(&smallFont);
+template <typename F>
+struct FontPack4 {
+  EpdFont regular;
+  EpdFont bold;
+  EpdFont italic;
+  EpdFont boldItalic;
+  EpdFontFamily family;
 
-EpdFont ui10RegularFont(&ubuntu_10_regular);
-EpdFont ui10BoldFont(&ubuntu_10_bold);
-EpdFontFamily ui10FontFamily(&ui10RegularFont, &ui10BoldFont);
+  FontPack4(const F* r, const F* b, const F* i, const F* bi)
+      : regular(r), bold(b), italic(i), boldItalic(bi), family(&regular, &bold, &italic, &boldItalic) {}
+};
 
-EpdFont ui12RegularFont(&ubuntu_12_regular);
-EpdFont ui12BoldFont(&ubuntu_12_bold);
-EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
+template <typename F>
+struct FontPack2 {
+  EpdFont regular;
+  EpdFont bold;
+  EpdFontFamily family;
 
-// measurement of power button press duration calibration value
-unsigned long t1 = 0;
-unsigned long t2 = 0;
+  FontPack2(const F* r, const F* b) : regular(r), bold(b), family(&regular, &bold) {}
+};
 
-void exitActivity() {
-  if (currentActivity) {
-    currentActivity->onExit();
-    delete currentActivity;
-    currentActivity = nullptr;
+template <typename F>
+struct FontPack1 {
+  EpdFont regular;
+  EpdFontFamily family;
+
+  explicit FontPack1(const F* r) : regular(r), family(&regular) {}
+};
+
+static FontPack4<BuiltinFontT> bookerly12(&bookerly_12_regular, &bookerly_12_bold, &bookerly_12_italic,
+                                          &bookerly_12_bolditalic);
+static FontPack4<BuiltinFontT> bookerly14(&bookerly_14_regular, &bookerly_14_bold, &bookerly_14_italic,
+                                          &bookerly_14_bolditalic);
+static FontPack4<BuiltinFontT> bookerly16(&bookerly_16_regular, &bookerly_16_bold, &bookerly_16_italic,
+                                          &bookerly_16_bolditalic);
+static FontPack4<BuiltinFontT> bookerly18(&bookerly_18_regular, &bookerly_18_bold, &bookerly_18_italic,
+                                          &bookerly_18_bolditalic);
+
+static FontPack4<BuiltinFontT> notosans12(&notosans_12_regular, &notosans_12_bold, &notosans_12_italic,
+                                          &notosans_12_bolditalic);
+static FontPack4<BuiltinFontT> notosans14(&notosans_14_regular, &notosans_14_bold, &notosans_14_italic,
+                                          &notosans_14_bolditalic);
+static FontPack4<BuiltinFontT> notosans16(&notosans_16_regular, &notosans_16_bold, &notosans_16_italic,
+                                          &notosans_16_bolditalic);
+static FontPack4<BuiltinFontT> notosans18(&notosans_18_regular, &notosans_18_bold, &notosans_18_italic,
+                                          &notosans_18_bolditalic);
+
+static FontPack4<BuiltinFontT> opendyslexic8(&opendyslexic_8_regular, &opendyslexic_8_bold, &opendyslexic_8_italic,
+                                             &opendyslexic_8_bolditalic);
+static FontPack4<BuiltinFontT> opendyslexic10(&opendyslexic_10_regular, &opendyslexic_10_bold, &opendyslexic_10_italic,
+                                              &opendyslexic_10_bolditalic);
+static FontPack4<BuiltinFontT> opendyslexic12(&opendyslexic_12_regular, &opendyslexic_12_bold, &opendyslexic_12_italic,
+                                              &opendyslexic_12_bolditalic);
+static FontPack4<BuiltinFontT> opendyslexic14(&opendyslexic_14_regular, &opendyslexic_14_bold, &opendyslexic_14_italic,
+                                              &opendyslexic_14_bolditalic);
+
+static FontPack2<BuiltinFontT> ui10(&ubuntu_10_regular, &ubuntu_10_bold);
+static FontPack2<BuiltinFontT> ui12(&ubuntu_12_regular, &ubuntu_12_bold);
+static FontPack1<BuiltinFontT> small(&notosans_8_regular);
+
+// ---------- Timing ----------
+static uint32_t bootT0 = 0;
+static uint32_t verifyT1 = 0;
+
+template <typename... Args>
+static inline void logf(const char* fmt, Args... args) {
+  if (Serial) {
+    Serial.printf(fmt, args...);
   }
 }
 
-void enterNewActivity(Activity* activity) {
-  currentActivity = activity;
-  currentActivity->onEnter();
+static void switchActivity(std::unique_ptr<Activity> next) {
+  if (currentActivity) currentActivity->onExit();
+  currentActivity = std::move(next);
+  if (currentActivity) currentActivity->onEnter();
 }
 
-// Verify long press on wake-up from deep sleep
-void verifyWakeupLongPress() {
-  // Give the user up to 1000ms to start holding the power button, and must hold for SETTINGS.getPowerButtonDuration()
-  const auto start = millis();
-  bool abort = false;
-  // Subtract the current time, because inputManager only starts counting the HeldTime from the first update()
-  // This way, we remove the time we already took to reach here from the duration,
-  // assuming the button was held until now from millis()==0 (i.e. device start time).
-  const uint16_t calibration = start;
-  const uint16_t calibratedPressDuration =
-      (calibration < SETTINGS.getPowerButtonDuration()) ? SETTINGS.getPowerButtonDuration() - calibration : 1;
-
-  inputManager.update();
-  // Verify the user has actually pressed
-  while (!inputManager.isPressed(InputManager::BTN_POWER) && millis() - start < 1000) {
-    delay(10);  // only wait 10ms each iteration to not delay too much in case of short configured duration.
-    inputManager.update();
-  }
-
-  t2 = millis();
-  if (inputManager.isPressed(InputManager::BTN_POWER)) {
-    do {
-      delay(10);
-      inputManager.update();
-    } while (inputManager.isPressed(InputManager::BTN_POWER) && inputManager.getHeldTime() < calibratedPressDuration);
-    abort = inputManager.getHeldTime() < calibratedPressDuration;
-  } else {
-    abort = true;
-  }
-
-  if (abort) {
-    // Button released too early. Returning to sleep.
-    // IMPORTANT: Re-arm the wakeup trigger before sleeping again
-    esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
-    esp_deep_sleep_start();
-  }
-}
-
-void waitForPowerRelease() {
+static void waitForPowerRelease() {
   inputManager.update();
   while (inputManager.isPressed(InputManager::BTN_POWER)) {
     delay(50);
@@ -189,176 +145,223 @@ void waitForPowerRelease() {
   }
 }
 
-// Enter deep sleep mode
-void enterDeepSleep() {
-  exitActivity();
-  enterNewActivity(new SleepActivity(renderer, mappedInputManager));
-
-  einkDisplay.deepSleep();
-  Serial.printf("[%lu] [   ] Power button press calibration value: %lu ms\n", millis(), t2 - t1);
-  Serial.printf("[%lu] [   ] Entering deep sleep.\n", millis());
+static inline void armWakeAndDeepSleepNow() {
   esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
-  // Ensure that the power button has been released to avoid immediately turning back on if you're holding it
-  waitForPowerRelease();
-  // Enter Deep Sleep
   esp_deep_sleep_start();
 }
 
-void onGoHome();
-void onGoToReader(const std::string& initialEpubPath) {
-  exitActivity();
-  enterNewActivity(new ReaderActivity(renderer, mappedInputManager, initialEpubPath, onGoHome));
-}
-void onGoToReaderHome() { onGoToReader(std::string()); }
-void onContinueReading() { onGoToReader(APP_STATE.openEpubPath); }
+static void verifyWakeupLongPress() {
+  // Only enforce on deep-sleep wake
+  if (esp_reset_reason() != ESP_RST_DEEPSLEEP) {
+    return;
+  }
 
-void onGoToFileTransfer() {
-  exitActivity();
-  enterNewActivity(new CrossPointWebServerActivity(renderer, mappedInputManager, onGoHome));
+  const uint32_t startMs = millis();
+  const uint32_t requiredMs = static_cast<uint32_t>(SETTINGS.getPowerButtonDuration());
+
+  inputManager.update();
+
+  // Give up to 1000ms to begin holding power
+  while (!inputManager.isPressed(InputManager::BTN_POWER) && (millis() - startMs < 1000)) {
+    delay(10);
+    inputManager.update();
+  }
+
+  verifyT1 = millis();
+
+  if (!inputManager.isPressed(InputManager::BTN_POWER)) {
+    armWakeAndDeepSleepNow();
+  }
+
+  // Require continuous hold for requiredMs
+  while (inputManager.isPressed(InputManager::BTN_POWER) && inputManager.getHeldTime() < requiredMs) {
+    delay(10);
+    inputManager.update();
+  }
+
+  if (inputManager.getHeldTime() < requiredMs) {
+    armWakeAndDeepSleepNow();
+  }
 }
 
-void onGoToSettings() {
-  exitActivity();
-  enterNewActivity(new SettingsActivity(renderer, mappedInputManager, onGoHome));
+// Forward declarations for callbacks
+static void onGoHome();
+
+static void openReader(const std::string& epubPath) {
+  g_readerStartPath = epubPath;  // stable storage
+  switchActivity(cp::make_unique<ReaderActivity>(renderer, mappedInputManager, g_readerStartPath, onGoHome));
 }
 
-void onGoHome() {
-  exitActivity();
-  enterNewActivity(new HomeActivity(renderer, mappedInputManager, onContinueReading, onGoToReaderHome, onGoToSettings,
-                                    onGoToFileTransfer));
+static void onGoToReaderHome() { openReader(std::string()); }
+static void onContinueReading() { openReader(APP_STATE.openEpubPath); }
+
+static void onGoToFileTransfer() {
+  switchActivity(cp::make_unique<CrossPointWebServerActivity>(renderer, mappedInputManager, onGoHome));
 }
 
-void setupDisplayAndFonts() {
+static void onGoToSettings() {
+  switchActivity(cp::make_unique<SettingsActivity>(renderer, mappedInputManager, onGoHome));
+}
+
+static void onGoHome() {
+  switchActivity(cp::make_unique<HomeActivity>(renderer, mappedInputManager, onContinueReading, onGoToReaderHome,
+                                               onGoToSettings, onGoToFileTransfer));
+}
+
+static void setupDisplayAndFonts() {
   einkDisplay.begin();
-  Serial.printf("[%lu] [   ] Display initialized\n", millis());
-  renderer.insertFont(BOOKERLY_12_FONT_ID, bookerly12FontFamily);
-  renderer.insertFont(BOOKERLY_14_FONT_ID, bookerly14FontFamily);
-  renderer.insertFont(BOOKERLY_16_FONT_ID, bookerly16FontFamily);
-  renderer.insertFont(BOOKERLY_18_FONT_ID, bookerly18FontFamily);
-  renderer.insertFont(NOTOSANS_12_FONT_ID, notosans12FontFamily);
-  renderer.insertFont(NOTOSANS_14_FONT_ID, notosans14FontFamily);
-  renderer.insertFont(NOTOSANS_16_FONT_ID, notosans16FontFamily);
-  renderer.insertFont(NOTOSANS_18_FONT_ID, notosans18FontFamily);
-  renderer.insertFont(OPENDYSLEXIC_8_FONT_ID, opendyslexic8FontFamily);
-  renderer.insertFont(OPENDYSLEXIC_10_FONT_ID, opendyslexic10FontFamily);
-  renderer.insertFont(OPENDYSLEXIC_12_FONT_ID, opendyslexic12FontFamily);
-  renderer.insertFont(OPENDYSLEXIC_14_FONT_ID, opendyslexic14FontFamily);
-  renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
-  renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
-  renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
-  Serial.printf("[%lu] [   ] Fonts setup\n", millis());
+  logf("[%lu] [   ] Display initialized\n", millis());
+
+  struct FontReg {
+    int32_t id;
+    EpdFontFamily* family;
+  };
+
+  static FontReg regs[] = {
+      {BOOKERLY_12_FONT_ID, &bookerly12.family},
+      {BOOKERLY_14_FONT_ID, &bookerly14.family},
+      {BOOKERLY_16_FONT_ID, &bookerly16.family},
+      {BOOKERLY_18_FONT_ID, &bookerly18.family},
+
+      {NOTOSANS_12_FONT_ID, &notosans12.family},
+      {NOTOSANS_14_FONT_ID, &notosans14.family},
+      {NOTOSANS_16_FONT_ID, &notosans16.family},
+      {NOTOSANS_18_FONT_ID, &notosans18.family},
+
+      {OPENDYSLEXIC_8_FONT_ID, &opendyslexic8.family},
+      {OPENDYSLEXIC_10_FONT_ID, &opendyslexic10.family},
+      {OPENDYSLEXIC_12_FONT_ID, &opendyslexic12.family},
+      {OPENDYSLEXIC_14_FONT_ID, &opendyslexic14.family},
+
+      {UI_10_FONT_ID, &ui10.family},
+      {UI_12_FONT_ID, &ui12.family},
+      {SMALL_FONT_ID, &small.family},
+  };
+
+  for (size_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); ++i) {
+    renderer.insertFont(regs[i].id, *regs[i].family);
+  }
+
+  logf("[%lu] [   ] Fonts setup\n", millis());
+}
+
+// Enter deep sleep mode (UI sleep activity + release protection)
+static void enterDeepSleep() {
+  switchActivity(cp::make_unique<SleepActivity>(renderer, mappedInputManager));
+
+  einkDisplay.deepSleep();
+
+  const uint32_t calib = (verifyT1 >= bootT0) ? (verifyT1 - bootT0) : 0;
+  logf("[%lu] [   ] Power button press calibration value: %lu ms\n", millis(), static_cast<unsigned long>(calib));
+  logf("[%lu] [   ] Entering deep sleep.\n", millis());
+
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+  // Avoid immediate wake if user is still holding power
+  waitForPowerRelease();
+
+  esp_deep_sleep_start();
 }
 
 void setup() {
-  t1 = millis();
+  bootT0 = millis();
+  verifyT1 = bootT0;
 
   // Only start serial if USB connected
-  pinMode(UART0_RXD, INPUT);
-  if (digitalRead(UART0_RXD) == HIGH) {
+  pinMode(BoardPins::UART0_RXD, INPUT);
+  if (digitalRead(BoardPins::UART0_RXD) == HIGH) {
     Serial.begin(115200);
   }
 
   inputManager.begin();
-  // Initialize pins
+  inputManager.update();
+
   pinMode(BAT_GPIO0, INPUT);
 
-  // Initialize SPI with custom pins
-  SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);
+  SPI.begin(BoardPins::EPD_SCLK, BoardPins::SD_SPI_MISO, BoardPins::EPD_MOSI, BoardPins::EPD_CS);
 
-  // SD Card Initialization
-  // We need 6 open files concurrently when parsing a new chapter
+  // SD Card init
   if (!SdMan.begin()) {
-    Serial.printf("[%lu] [   ] SD card initialization failed\n", millis());
+    logf("[%lu] [   ] SD card initialization failed\n", millis());
     setupDisplayAndFonts();
-    exitActivity();
-    enterNewActivity(new FullScreenMessageActivity(renderer, mappedInputManager, "SD card error", EpdFontFamily::BOLD));
+    switchActivity(
+        cp::make_unique<FullScreenMessageActivity>(renderer, mappedInputManager, "SD card error", EpdFontFamily::BOLD));
     return;
   }
 
   SETTINGS.loadFromFile();
-
-  // verify power button press duration after we've read settings.
   verifyWakeupLongPress();
 
-  // First serial output only here to avoid timing inconsistencies for power button press duration verification
-  Serial.printf("[%lu] [   ] Starting CrossPoint version " CROSSPOINT_VERSION "\n", millis());
+  logf("[%lu] [   ] Starting CrossPoint version " CROSSPOINT_VERSION "\n", millis());
 
   setupDisplayAndFonts();
-
-  exitActivity();
-  enterNewActivity(new BootActivity(renderer, mappedInputManager));
+  switchActivity(cp::make_unique<BootActivity>(renderer, mappedInputManager));
 
   APP_STATE.loadFromFile();
   if (APP_STATE.openEpubPath.empty()) {
     onGoHome();
   } else {
-    // Clear app state to avoid getting into a boot loop if the epub doesn't load
-    const auto path = APP_STATE.openEpubPath;
-    APP_STATE.openEpubPath = "";
+    const std::string path = APP_STATE.openEpubPath;
+    APP_STATE.openEpubPath.clear();
     APP_STATE.saveToFile();
-    onGoToReader(path);
+    openReader(path);
   }
 
-  // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
 }
 
 void loop() {
   static unsigned long maxLoopDuration = 0;
-  const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+  static unsigned long lastActivityTime = 0;
 
+  const unsigned long loopStartTime = millis();
   inputManager.update();
 
-  if (Serial && millis() - lastMemPrint >= 10000) {
-    Serial.printf("[%lu] [MEM] Free: %d bytes, Total: %d bytes, Min Free: %d bytes\n", millis(), ESP.getFreeHeap(),
-                  ESP.getHeapSize(), ESP.getMinFreeHeap());
-    lastMemPrint = millis();
+  const unsigned long now = millis();
+
+  if (Serial && (now - lastMemPrint >= 10000)) {
+    logf("[%lu] [MEM] Free: %d bytes, Total: %d bytes, Min Free: %d bytes\n", now, ESP.getFreeHeap(), ESP.getHeapSize(),
+         ESP.getMinFreeHeap());
+    lastMemPrint = now;
   }
 
-  // Check for any user activity (button press or release) or active background work
-  static unsigned long lastActivityTime = millis();
+  if (lastActivityTime == 0) lastActivityTime = now;
+
   if (inputManager.wasAnyPressed() || inputManager.wasAnyReleased() ||
       (currentActivity && currentActivity->preventAutoSleep())) {
-    lastActivityTime = millis();  // Reset inactivity timer
+    lastActivityTime = now;
   }
 
   const unsigned long sleepTimeoutMs = SETTINGS.getSleepTimeoutMs();
-  if (millis() - lastActivityTime >= sleepTimeoutMs) {
-    Serial.printf("[%lu] [SLP] Auto-sleep triggered after %lu ms of inactivity\n", millis(), sleepTimeoutMs);
+  if (now - lastActivityTime >= sleepTimeoutMs) {
+    logf("[%lu] [SLP] Auto-sleep triggered after %lu ms of inactivity\n", now, sleepTimeoutMs);
     enterDeepSleep();
-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
   }
 
   if (inputManager.isPressed(InputManager::BTN_POWER) &&
       inputManager.getHeldTime() > SETTINGS.getPowerButtonDuration()) {
     enterDeepSleep();
-    // This should never be hit as `enterDeepSleep` calls esp_deep_sleep_start
     return;
   }
 
   const unsigned long activityStartTime = millis();
-  if (currentActivity) {
-    currentActivity->loop();
-  }
+  if (currentActivity) currentActivity->loop();
   const unsigned long activityDuration = millis() - activityStartTime;
 
   const unsigned long loopDuration = millis() - loopStartTime;
   if (loopDuration > maxLoopDuration) {
     maxLoopDuration = loopDuration;
     if (maxLoopDuration > 50) {
-      Serial.printf("[%lu] [LOOP] New max loop duration: %lu ms (activity: %lu ms)\n", millis(), maxLoopDuration,
-                    activityDuration);
+      logf("[%lu] [LOOP] New max loop duration: %lu ms (activity: %lu ms)\n", millis(), maxLoopDuration,
+           activityDuration);
     }
   }
 
-  // Add delay at the end of the loop to prevent tight spinning
-  // When an activity requests skip loop delay (e.g., webserver running), use yield() for faster response
-  // Otherwise, use longer delay to save power
   if (currentActivity && currentActivity->skipLoopDelay()) {
-    yield();  // Give FreeRTOS a chance to run tasks, but return immediately
+    yield();
   } else {
-    delay(10);  // Normal delay when no activity requires fast response
+    delay(10);
   }
 }
